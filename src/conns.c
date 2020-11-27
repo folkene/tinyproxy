@@ -55,7 +55,15 @@ struct conn_s *initialize_conn (int client_fd, const char *ipaddr,
                 goto error_exit;
 
         connptr->client_fd = client_fd;
+
+#ifndef REMOTE_SOCKET
         connptr->server_fd = -1;
+#else
+        connptr->server_fd[0][0] = -1;
+        connptr->server_fd[0][1] = -1;
+        connptr->server_fd[1][0] = -1;
+        connptr->server_fd[1][1] = -1;
+#endif
 
         connptr->cbuffer = cbuffer;
         connptr->sbuffer = sbuffer;
@@ -109,10 +117,17 @@ void destroy_conn (struct conn_s *connptr)
                 if (close (connptr->client_fd) < 0)
                         log_message (LOG_INFO, "Client (%d) close message: %s",
                                      connptr->client_fd, strerror (errno));
+#ifndef REMOTE_SOCKET
         if (connptr->server_fd != -1)
                 if (close (connptr->server_fd) < 0)
                         log_message (LOG_INFO, "Server (%d) close message: %s",
                                      connptr->server_fd, strerror (errno));
+#else
+        if (connptr->server_fd[0] != -1){
+                close(connptr->server_fd[0]);
+                close(connptr->server_fd[1]);
+        }
+#endif
 
         if (connptr->cbuffer)
                 delete_buffer (connptr->cbuffer);

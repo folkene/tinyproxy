@@ -33,6 +33,8 @@ typedef struct {
         char *value;
 } http_header_t;
 
+#define MAX_HOST_LEN 16
+
 /*
  * Hold all the configuration time information.
  */
@@ -110,6 +112,11 @@ struct config_s {
          * Extra headers to be added to outgoing HTTP requests.
          */
         vector_t add_headers;
+
+#ifdef REMOTE_SOCKET
+        unsigned int remote_socket_port;
+        char remote_socket_host[128];
+#endif
 };
 
 extern int reload_config_file (const char *config_fname, struct config_s *conf);

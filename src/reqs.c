@@ -50,6 +50,7 @@
 #include "conf.h"
 #include "basicauth.h"
 #include "loop.h"
+#include "sock_proxy.h"
 
 /*
  * Maximum length of a HTTP line
@@ -265,7 +266,11 @@ establish_http_connection (struct conn_s *connptr, struct request_s *request)
         if (inet_pton(AF_INET6, request->host, dst) > 0) {
                 /* host is an IPv6 address literal, so surround it with
                  * [] */
+#ifndef REMOTE_SOCKET
                 return write_message (connptr->server_fd,
+#else
+                return write_message (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET],
+#endif
                                       "%s %s HTTP/1.0\r\n"
                                       "Host: [%s]%s\r\n"
                                       "Connection: close\r\n",
@@ -274,7 +279,11 @@ establish_http_connection (struct conn_s *connptr, struct request_s *request)
         } else if (connptr->upstream_proxy &&
                    connptr->upstream_proxy->type == PT_HTTP &&
                    connptr->upstream_proxy->ua.authstr) {
+#ifndef REMOTE_SOCKET
                 return write_message (connptr->server_fd,
+#else
+                return write_message (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET],
+#endif
                                       "%s %s HTTP/1.0\r\n"
                                       "Host: %s%s\r\n"
                                       "Connection: close\r\n"
@@ -283,7 +292,11 @@ establish_http_connection (struct conn_s *connptr, struct request_s *request)
                                       request->host, portbuff,
                                       connptr->upstream_proxy->ua.authstr);
         } else {
+#ifndef REMOTE_SOCKET
                 return write_message (connptr->server_fd,
+#else
+                return write_message (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET],
+#endif
                                       "%s %s HTTP/1.0\r\n"
                                       "Host: %s%s\r\n"
                                       "Connection: close\r\n",
@@ -526,8 +539,13 @@ static int pull_client_data (struct conn_s *connptr, long int length)
                         goto ERROR_EXIT;
 
                 if (!connptr->error_variables) {
-                        if (safe_write (connptr->server_fd, buffer, len) < 0)
+#ifndef REMOTE_SOCKET
+                if (safe_write (connptr->server_fd, buffer, len) < 0)
                                 goto ERROR_EXIT;
+#else
+                if (safe_write (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], buffer, len) < 0)
+                                goto ERROR_EXIT;
+#endif
                 }
 
                 length -= len;
@@ -584,9 +602,15 @@ ERROR_EXIT:
  */
 static int add_xtinyproxy_header (struct conn_s *connptr)
 {
+#ifndef REMOTE_SOCKET
         assert (connptr && connptr->server_fd >= 0);
         return write_message (connptr->server_fd,
                               "X-Tinyproxy: %s\r\n", connptr->client_ip_addr);
+#else
+        assert (connptr && connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET] >= 0);
+        return write_message (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET],
+                              "X-Tinyproxy: %s\r\n", connptr->client_ip_addr);
+#endif
 }
 #endif /* XTINYPROXY */
 
@@ -646,6 +670,9 @@ static int get_all_headers (int fd, hashmap_t hashofheaders)
                         safefree (line);
                         return -1;
                 }
+
+                log_message (LOG_INFO,
+                             "getAllHeader readline (fd : %d) %d: %s", fd,  linelen, line);
 
                 /*
                  * If we received a CR LF or a non-continuation line, then add
@@ -802,7 +829,7 @@ write_via_header (int fd, hashmap_t hashofheaders,
         ssize_t len;
         char hostname[512];
         char *data;
-        int ret;
+        int ret = 0;
 
         if (config->disable_viaheader) {
                 ret = 0;
@@ -820,7 +847,9 @@ write_via_header (int fd, hashmap_t hashofheaders,
          * of processing.
          */
         len = hashmap_entry_by_key (hashofheaders, "via", (void **) &data);
+#ifndef REMOTE_SOCKET
         if (len > 0) {
+
                 ret = write_message (fd,
                                      "Via: %s, %hu.%hu %s (%s/%s)\r\n",
                                      data, major, minor, hostname, PACKAGE,
@@ -832,6 +861,7 @@ write_via_header (int fd, hashmap_t hashofheaders,
                                      "Via: %hu.%hu %s (%s/%s)\r\n",
                                      major, minor, hostname, PACKAGE, VERSION);
         }
+#endif
 
 done:
         return ret;
@@ -870,12 +900,21 @@ process_client_headers (struct conn_s *connptr, hashmap_t hashofheaders)
          * a stats request, or if this was a CONNECT method (unless upstream
          * http proxy is in use.)
          */
+#ifndef REMOTE_SOCKET
         if (connptr->server_fd == -1 || connptr->show_stats
             || (connptr->connect_method && ! UPSTREAM_IS_HTTP(connptr))) {
                 log_message (LOG_INFO,
                              "Not sending client headers to remote machine");
                 return 0;
         }
+#else
+        if (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET] == -1 || connptr->show_stats
+            || (connptr->connect_method && ! UPSTREAM_IS_HTTP(connptr))) {
+                log_message (LOG_INFO,
+                             "Not sending client headers to remote machine");
+                return 0;
+        }
+#endif
 
         /*
          * See if there is a "Content-Length" header.  If so, again we need
@@ -897,12 +936,17 @@ process_client_headers (struct conn_s *connptr, hashmap_t hashofheaders)
         }
 
         /* Send, or add the Via header */
-        ret = write_via_header (connptr->server_fd, hashofheaders,
+#ifndef REMOTE_SOCKET
+        ret = write_via_header (connptr->server_fd,
+#else
+        ret = write_via_header (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET],
+#endif
+                                hashofheaders,
                                 connptr->protocol.major,
                                 connptr->protocol.minor);
         if (ret < 0) {
                 indicate_http_error (connptr, 503,
-                                     "Could not send data to remote server",
+                                     "Could not send data to remote server 1",
                                      "detail",
                                      "A network error occurred while "
                                      "trying to write data to the remote web server.",
@@ -922,11 +966,17 @@ process_client_headers (struct conn_s *connptr, hashmap_t hashofheaders)
                         if (!is_anonymous_enabled (config)
                             || anonymous_search (config, data) > 0) {
                                 ret =
-                                    write_message (connptr->server_fd,
+#ifndef REMOTE_SOCKET
+                                write_message (connptr->server_fd,
                                                    "%s: %s\r\n", data, header);
+#else
+                                write_message (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET],
+                                                   "%s: %s\r\n", data, header);
+#endif
                                 if (ret < 0) {
+                                        log_message(LOG_ERR, "error %s : ", strerror(errno));
                                         indicate_http_error (connptr, 503,
-                                                             "Could not send data to remote server",
+                                                             "Could not send data to remote server 2",
                                                              "detail",
                                                              "A network error occurred while "
                                                              "trying to write data to the "
@@ -942,9 +992,16 @@ process_client_headers (struct conn_s *connptr, hashmap_t hashofheaders)
                 add_xtinyproxy_header (connptr);
 #endif
 
+#ifndef REMOTE_SOCKET
         /* Write the final "blank" line to signify the end of the headers */
         if (safe_write (connptr->server_fd, "\r\n", 2) < 0)
                 return -1;
+
+#else
+        /* Write the final "blank" line to signify the end of the headers */
+        if (safe_write (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], "\r\n", 2) < 0)
+                return -1;
+#endif
 
         /*
          * Spin here pulling the data from the client.
@@ -986,7 +1043,11 @@ static int process_server_headers (struct conn_s *connptr)
 
         /* Get the response line from the remote server. */
 retry:
+#ifndef REMOTE_SOCKET
         len = readline (connptr->server_fd, &response_line);
+#else
+        len = readline (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], &response_line);
+#endif
         if (len <= 0)
                 return -1;
 
@@ -1012,7 +1073,12 @@ retry:
         /*
          * Get all the headers from the remote server in a big hash
          */
-        if (get_all_headers (connptr->server_fd, hashofheaders) < 0) {
+#ifndef REMOTE_SOCKET
+        if (get_all_headers (connptr->server_fd, hashofheaders) < 0)
+#else
+        if (get_all_headers (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], hashofheaders) < 0)
+#endif
+        {
                 log_message (LOG_WARNING,
                              "Could not retrieve all the headers from the remote server.");
                 hashmap_delete (hashofheaders);
@@ -1142,6 +1208,8 @@ ERROR_EXIT:
         return -1;
 }
 
+
+#if 0
 /*
  * Switch the sockets into nonblocking mode and begin relaying the bytes
  * between the two connections. We continue to use the buffering code
@@ -1157,26 +1225,36 @@ static void relay_connection (struct conn_s *connptr)
         time_t last_access;
         int ret;
         double tdiff;
+#ifndef REMOTE_SOCKET
         int maxfd = max (connptr->client_fd, connptr->server_fd) + 1;
+#else
+        int maxfd = max (connptr->client_fd, connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET]) + 1;
+#endif
+
         ssize_t bytes_received;
 
         ret = socket_nonblocking (connptr->client_fd);
         if (ret != 0) {
                 log_message(LOG_ERR, "Failed to set the client socket "
                             "to non-blocking: %s", strerror(errno));
-                return;
+                goto end;
         }
 
+#ifndef REMOTE_SOCKET
         ret = socket_nonblocking (connptr->server_fd);
+#else
+        ret = socket_nonblocking (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET]);
+#endif
         if (ret != 0) {
                 log_message(LOG_ERR, "Failed to set the server socket "
                             "to non-blocking: %s", strerror(errno));
-                return;
+                goto end;
         }
 
         last_access = time (NULL);
 
         for (;;) {
+                log_message(LOG_INFO, "Loop relay_connection / sBuffer size = %d, cbuffer size = %d", buffer_size (connptr->sbuffer), buffer_size (connptr->cbuffer));
                 FD_ZERO (&rset);
                 FD_ZERO (&wset);
 
@@ -1187,9 +1265,18 @@ static void relay_connection (struct conn_s *connptr)
                 if (buffer_size (connptr->sbuffer) > 0)
                         FD_SET (connptr->client_fd, &wset);
                 if (buffer_size (connptr->cbuffer) > 0)
+#ifndef REMOTE_SOCKET
                         FD_SET (connptr->server_fd, &wset);
+#else
+                        FD_SET (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], &wset);
+                        log_message(LOG_INFO, "FD_ISSET = %d", FD_ISSET (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], &wset));
+#endif
                 if (buffer_size (connptr->sbuffer) < MAXBUFFSIZE)
+#ifndef REMOTE_SOCKET
                         FD_SET (connptr->server_fd, &rset);
+#else
+                        FD_SET (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], &rset);
+#endif
                 if (buffer_size (connptr->cbuffer) < MAXBUFFSIZE)
                         FD_SET (connptr->client_fd, &rset);
 
@@ -1208,10 +1295,9 @@ static void relay_connection (struct conn_s *connptr)
                 } else if (ret < 0) {
                         log_message (LOG_ERR,
                                      "relay_connection: select() error \"%s\". "
-                                     "Closing connection (client_fd:%d, server_fd:%d)",
-                                     strerror (errno), connptr->client_fd,
-                                     connptr->server_fd);
-                        return;
+                                     "Closing connection (client_fd:%d, server_fd)",
+                                     strerror (errno), connptr->client_fd);
+                        goto end;
                 } else {
                         /*
                          * All right, something was actually selected so mark it.
@@ -1219,9 +1305,18 @@ static void relay_connection (struct conn_s *connptr)
                         last_access = time (NULL);
                 }
 
+#ifndef REMOTE_SOCKET
                 if (FD_ISSET (connptr->server_fd, &rset)) {
                         bytes_received =
                             read_buffer (connptr->server_fd, connptr->sbuffer);
+#else
+                if (FD_ISSET (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], &rset)) {
+                        bytes_received =
+                            read_buffer (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], connptr->sbuffer);
+
+                        log_message(LOG_INFO, "relay connection : Received %d bytes from remote server fd %d", bytes_received, connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET]);
+#endif
+
                         if (bytes_received < 0)
                                 break;
 
@@ -1233,10 +1328,19 @@ static void relay_connection (struct conn_s *connptr)
                     && read_buffer (connptr->client_fd, connptr->cbuffer) < 0) {
                         break;
                 }
+#ifndef REMOTE_SOCKET
                 if (FD_ISSET (connptr->server_fd, &wset)
                     && write_buffer (connptr->server_fd, connptr->cbuffer) < 0) {
                         break;
                 }
+#else
+                log_message(LOG_INFO, "FD_ISSET = %d", FD_ISSET (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], &wset));
+
+                if (FD_ISSET (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], &wset)
+                    && write_buffer (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], connptr->cbuffer) < 0) {
+                        break;
+                }
+#endif
                 if (FD_ISSET (connptr->client_fd, &wset)
                     && write_buffer (connptr->client_fd, connptr->sbuffer) < 0) {
                         break;
@@ -1252,7 +1356,169 @@ static void relay_connection (struct conn_s *connptr)
                 log_message(LOG_ERR,
                             "Failed to set client socket to blocking: %s",
                             strerror(errno));
-                return;
+                goto end;
+        }
+
+        while (buffer_size (connptr->sbuffer) > 0) {
+                if (write_buffer (connptr->client_fd, connptr->sbuffer) < 0)
+                        break;
+        }
+        shutdown (connptr->client_fd, SHUT_WR);
+
+#ifndef REMOTE_SOCKET
+        /*
+         * Try to send any remaining data to the server if we can.
+         */
+        ret = socket_blocking (connptr->server_fd);
+        if (ret != 0) {
+                log_message(LOG_ERR,
+                            "Failed to set server socket to blocking: %s",
+                            strerror(errno));
+                goto end;
+        }
+
+        while (buffer_size (connptr->cbuffer) > 0) {
+                if (write_buffer (connptr->server_fd, connptr->cbuffer) < 0)
+                        break;
+        }
+#else
+        /*
+         * Try to send any remaining data to the server if we can.
+         */
+        ret = socket_blocking (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET]);
+        if (ret != 0) {
+                log_message(LOG_ERR,
+                            "Failed to set server socket to blocking: %s",
+                            strerror(errno));
+                goto end;
+        }
+
+        while (buffer_size (connptr->cbuffer) > 0) {
+                if (write_buffer (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], connptr->cbuffer) < 0)
+                        break;
+        }
+
+#endif
+
+end:
+        log_message(LOG_INFO, "end of relay_connection");
+
+        return;
+}
+
+#endif
+
+
+
+
+
+
+
+
+
+static void relay_connection (struct conn_s *connptr)
+{
+        fd_set rset;
+        struct timeval tv;
+        time_t last_access;
+        int ret;
+        double tdiff;
+        int maxfd = max (connptr->client_fd, connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET]) + 1;
+
+        ssize_t bytes_received;
+
+        ret = socket_nonblocking (connptr->client_fd);
+        if (ret != 0) {
+                log_message(LOG_ERR, "Failed to set the client socket "
+                            "to non-blocking: %s", strerror(errno));
+                goto end;
+        }
+
+        // ret = socket_nonblocking (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET]);
+        // if (ret != 0) {
+        //         log_message(LOG_ERR, "Failed to set the server socket "
+        //                     "to non-blocking: %s", strerror(errno));
+        //         goto end;
+        // }
+
+        last_access = time (NULL);
+
+        for (;;) {
+                log_message(LOG_INFO, "Loop relay_connection / sBuffer size = %d, cbuffer size = %d", buffer_size (connptr->sbuffer), buffer_size (connptr->cbuffer));
+                FD_ZERO (&rset);
+
+                tv.tv_sec =
+                    config->idletimeout - difftime (time (NULL), last_access);
+                tv.tv_usec = 0;
+
+                if (buffer_size (connptr->sbuffer) < MAXBUFFSIZE)
+                        FD_SET (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], &rset);
+
+                if (buffer_size (connptr->cbuffer) < MAXBUFFSIZE)
+                        FD_SET (connptr->client_fd, &rset);
+
+                ret = select (maxfd, &rset, NULL, NULL, &tv);
+
+                if (ret == 0) {
+                        tdiff = difftime (time (NULL), last_access);
+                        if (tdiff > config->idletimeout) {
+                                log_message (LOG_INFO,
+                                             "Idle Timeout (after select) as %g > %u.",
+                                             tdiff, config->idletimeout);
+                                return;
+                        } else {
+                                continue;
+                        }
+                } else if (ret < 0) {
+                        log_message (LOG_ERR,
+                                     "relay_connection: select() error \"%s\". "
+                                     "Closing connection (client_fd:%d, server_fd=%d)",
+                                     strerror (errno), connptr->client_fd, connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET]);
+                        goto end;
+                } else {
+                        /*
+                         * All right, something was actually selected so mark it.
+                         */
+                        last_access = time (NULL);
+                }
+
+                if (FD_ISSET (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], &rset)) {
+                        bytes_received =
+                            read_buffer (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], connptr->sbuffer);
+
+                        log_message(LOG_INFO, "relay connection : Received %d bytes from remote server fd %d", bytes_received, connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET]);
+
+                        if (bytes_received < 0)
+                                break;
+
+                        write_buffer (connptr->client_fd, connptr->sbuffer);
+
+                        connptr->content_length.server -= bytes_received;
+                        if (connptr->content_length.server == 0)
+                                break;
+                }
+                if (FD_ISSET (connptr->client_fd, &rset)){
+                    bytes_received = read_buffer (connptr->client_fd, connptr->cbuffer);
+
+                    log_message(LOG_INFO, "relay connection : Received %d bytes from client fd %d", bytes_received, connptr->client_fd);
+
+                    if (bytes_received < 0)
+                        break;
+
+                    write_buffer (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], connptr->cbuffer);
+                }
+        }
+
+        /*
+         * Here the server has closed the connection... write the
+         * remainder to the client and then exit.
+         */
+        ret = socket_blocking (connptr->client_fd);
+        if (ret != 0) {
+                log_message(LOG_ERR,
+                            "Failed to set client socket to blocking: %s",
+                            strerror(errno));
+                goto end;
         }
 
         while (buffer_size (connptr->sbuffer) > 0) {
@@ -1264,21 +1530,46 @@ static void relay_connection (struct conn_s *connptr)
         /*
          * Try to send any remaining data to the server if we can.
          */
-        ret = socket_blocking (connptr->server_fd);
+        ret = socket_blocking (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET]);
         if (ret != 0) {
                 log_message(LOG_ERR,
                             "Failed to set server socket to blocking: %s",
                             strerror(errno));
-                return;
+                goto end;
         }
 
         while (buffer_size (connptr->cbuffer) > 0) {
-                if (write_buffer (connptr->server_fd, connptr->cbuffer) < 0)
+                if (write_buffer (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], connptr->cbuffer) < 0)
                         break;
         }
 
+end:
+        log_message(LOG_INFO, "end of relay_connection");
+
         return;
+
+
+
+
 }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 static int
 connect_to_upstream_proxy(struct conn_s *connptr, struct request_s *request)
@@ -1297,7 +1588,7 @@ connect_to_upstream_proxy(struct conn_s *connptr, struct request_s *request)
 
 	log_message(LOG_CONN,
 		    "Established connection to %s proxy \"%s\" using file descriptor %d.",
-		    proxy_type_name(cur_upstream->type), cur_upstream->host, connptr->server_fd);
+		    proxy_type_name(cur_upstream->type), cur_upstream->host, connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET]);
 
 	if (cur_upstream->type == PT_SOCKS4) {
 
@@ -1308,9 +1599,9 @@ connect_to_upstream_proxy(struct conn_s *connptr, struct request_s *request)
 		host = gethostbyname(request->host);
 		memcpy(&buff[4], host->h_addr_list[0], 4); /* dest ip */
 		buff[8] = 0; /* user */
-		if (9 != safe_write(connptr->server_fd, buff, 9))
+		if (9 != safe_write(connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], buff, 9))
 			return -1;
-		if (8 != safe_read(connptr->server_fd, buff, 8))
+		if (8 != safe_read(connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], buff, 8))
 			return -1;
 		if (buff[0]!=0 || buff[1]!=90)
 			return -1;
@@ -1323,9 +1614,9 @@ connect_to_upstream_proxy(struct conn_s *connptr, struct request_s *request)
 		buff[1] = n_methods; /* number of methods  */
 		buff[2] = 0; /* no auth method */
 		if (ulen) buff[3] = 2;  /* auth method -> username / password */
-		if (2+n_methods != safe_write(connptr->server_fd, buff, 2+n_methods))
+		if (2+n_methods != safe_write(connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], buff, 2+n_methods))
 			return -1;
-		if (2 != safe_read(connptr->server_fd, buff, 2))
+		if (2 != safe_read(connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], buff, 2))
 			return -1;
 		if (buff[0] != 5 || (buff[1] != 0 && buff[1] != 2))
 			return -1;
@@ -1346,10 +1637,10 @@ connect_to_upstream_proxy(struct conn_s *connptr, struct request_s *request)
 			memcpy(cur, cur_upstream->pass, c);
 			cur += c;
 
-			if((cur - out) != safe_write(connptr->server_fd, out, cur - out))
+			if((cur - out) != safe_write(connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], out, cur - out))
 				return -1;
 
-			if(2 != safe_read(connptr->server_fd, in, 2))
+			if(2 != safe_read(connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], in, 2))
 				return -1;
 			if(in[1] != 0 || !(in[0] == 5 || in[0] == 1)) {
 				return -1;
@@ -1367,9 +1658,9 @@ connect_to_upstream_proxy(struct conn_s *connptr, struct request_s *request)
 		memcpy(&buff[5], request->host, len); /* dest ip */
 		port = htons(request->port);
 		memcpy(&buff[5+len], &port, 2); /* dest port */
-		if (7+len != safe_write(connptr->server_fd, buff, 7+len))
+		if (7+len != safe_write(connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], buff, 7+len))
 			return -1;
-		if (4 != safe_read(connptr->server_fd, buff, 4))
+		if (4 != safe_read(connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], buff, 4))
 			return -1;
 		if (buff[0]!=5 || buff[1]!=0)
 			return -1;
@@ -1377,13 +1668,13 @@ connect_to_upstream_proxy(struct conn_s *connptr, struct request_s *request)
 			case 1: len=4; break; /* ip v4 */
 			case 4: len=16; break; /* ip v6 */
 			case 3: /* domainname */
-				if (1 != safe_read(connptr->server_fd, buff, 1))
+				if (1 != safe_read(connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], buff, 1))
 					return -1;
 				len = buff[0]; /* max = 255 */
 				break;
 			default: return -1;
 		}
-		if (2+len != safe_read(connptr->server_fd, buff, 2+len))
+		if (2+len != safe_read(connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], buff, 2+len))
 			return -1;
 	} else {
 		return -1;
@@ -1423,6 +1714,7 @@ connect_to_upstream (struct conn_s *connptr, struct request_s *request)
                 return -1;
         }
 
+#ifndef REMOTE_SOCKET
         connptr->server_fd =
             opensock (cur_upstream->host, cur_upstream->port,
                       connptr->server_ip_addr);
@@ -1478,6 +1770,7 @@ connect_to_upstream (struct conn_s *connptr, struct request_s *request)
         request->path = combined_string;
 
         return establish_http_connection (connptr, request);
+#endif // Remote_PROXY
 #endif
 }
 
@@ -1701,6 +1994,7 @@ e401:
                         goto fail;
                 }
         } else {
+#ifndef REMOTE_SOCKET
                 connptr->server_fd = opensock (request->host, request->port,
                                                connptr->server_ip_addr);
                 if (connptr->server_fd < 0) {
@@ -1716,6 +2010,21 @@ e401:
                              "Established connection to host \"%s\" using "
                              "file descriptor %d.", request->host,
                              connptr->server_fd);
+#else
+                if( remote_open(request->host, request->port,connptr->server_fd) < 0 ){
+                        indicate_http_error (connptr, 500, "Unable to connect",
+                                             "detail",
+                                             PACKAGE_NAME " "
+                                             "was unable to connect to the remote web server.",
+                                             "error", strerror (errno), NULL);
+                        goto fail;
+                }
+                log_message (LOG_CONN,
+                             "Established connection to host \"%s\" using "
+                             "file descriptor %d.", request->host,
+                             connptr->server_fd[0]);
+#endif
+
 
                 if (!connptr->connect_method)
                         establish_http_connection (connptr, request);
@@ -1745,8 +2054,8 @@ e401:
 
         log_message (LOG_INFO,
                      "Closed connection between local client (fd:%d) "
-                     "and remote client (fd:%d)",
-                     connptr->client_fd, connptr->server_fd);
+                     "and remote client (fd:0)",
+                     connptr->client_fd);
 
         goto done;
 

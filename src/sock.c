@@ -64,6 +64,8 @@ bind_socket (int sockfd, const char *addr, int family)
         hints.ai_family = family;
         hints.ai_socktype = SOCK_STREAM;
 
+        log_message(LOG_INFO, "bind_socket enter");
+
         /* The local port is not important */
         n = getaddrinfo (addr, NULL, &hints, &res);
         if (n != 0) {
@@ -166,6 +168,9 @@ int opensock (const char *host, int port, const char *bind_to)
                 return -1;
         }
 
+        log_message(LOG_INFO,
+                    "opensock: returned socket %d", sockfd);
+
         return sockfd;
 }
 
@@ -177,6 +182,9 @@ int socket_nonblocking (int sock)
         int flags;
 
         assert (sock >= 0);
+
+        log_message(LOG_INFO,
+                    "socket_nonblocking:  socket %d", sock);
 
         flags = fcntl (sock, F_GETFL, 0);
         return fcntl (sock, F_SETFL, flags | O_NONBLOCK);
@@ -190,6 +198,9 @@ int socket_blocking (int sock)
         int flags;
 
         assert (sock >= 0);
+
+        log_message(LOG_INFO,
+                    "socket_blocking:  socket %d", sock);
 
         flags = fcntl (sock, F_GETFL, 0);
         return fcntl (sock, F_SETFL, flags & ~O_NONBLOCK);

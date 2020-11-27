@@ -237,8 +237,10 @@ ssize_t read_buffer (int fd, struct buffer_s * buffptr)
                         bytesin = -1;
                 }
         } else if (bytesin == 0) {
+#ifdef REMOTE_SOCKET
                 /* connection was closed by client */
                 bytesin = -1;
+#endif
         } else {
                 switch (errno) {
 #ifdef EWOULDBLOCK
@@ -261,6 +263,9 @@ ssize_t read_buffer (int fd, struct buffer_s * buffptr)
         }
 
         safefree (buffer);
+
+        log_message(LOG_INFO, "Read from fd:%d %d bytes", fd, bytesin);
+
         return bytesin;
 }
 
@@ -276,16 +281,24 @@ ssize_t write_buffer (int fd, struct buffer_s * buffptr)
         assert (fd >= 0);
         assert (buffptr != NULL);
 
+        log_message (LOG_INFO,
+                        "write_buffer fd:%d size:%d",
+                        fd,
+                        buffptr->size);
+
         if (buffptr->size == 0)
                 return 0;
+
+
 
         /* Sanity check. It would be bad to be using a NULL pointer! */
         assert (BUFFER_HEAD (buffptr) != NULL);
         line = BUFFER_HEAD (buffptr);
 
+        log_message(LOG_INFO, "Write fd:%d %d bytes", fd, buffptr->size);
+
         bytessent =
-            send (fd, line->string + line->pos, line->length - line->pos,
-                  MSG_NOSIGNAL);
+            write (fd, line->string + line->pos, line->length - line->pos);
 
         if (bytessent >= 0) {
                 /* bytes sent, adjust buffer */

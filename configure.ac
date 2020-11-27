@@ -96,6 +96,19 @@ if test x"$transparent_enabled" = x"yes"; then
    AC_DEFINE(TRANSPARENT_PROXY)
 fi
 
+dnl Include the transparent proxy support
+AH_TEMPLATE([REMOTE_SOCKET],
+	    [Include support for uremote socket.])
+TP_ARG_ENABLE(remote_socket,
+              [Enable remote socket (default is YES)],
+              yes)
+if test x"$remote_socket_enabled" = x"yes"; then
+   ADDITIONAL_OBJECTS="$ADDITIONAL_OBJECTS sock_proxy.o"
+    AC_DEFINE(REMOTE_SOCKET)
+fi
+
+
+
 dnl Let user decide whether he wants support for manpages
 dnl Which require either pod2man or a tarball release
 AH_TEMPLATE([MANPAGE_SUPPORT],

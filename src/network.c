@@ -34,6 +34,12 @@
  */
 ssize_t safe_write (int fd, const void *buf, size_t count)
 {
+
+        log_message(LOG_INFO,
+                    "safe_write:  socket %d, mssg size:%d", fd, count);
+
+        log_message(LOG_INFO,
+                    "safe_write:  %s", buf);
         ssize_t len;
         size_t bytestosend;
 	const char *buffer = buf;
@@ -45,7 +51,7 @@ ssize_t safe_write (int fd, const void *buf, size_t count)
         bytestosend = count;
 
         while (1) {
-                len = send (fd, buffer, bytestosend, MSG_NOSIGNAL);
+                len = write (fd, buffer, bytestosend);
 
                 if (len < 0) {
                         if (errno == EINTR)
@@ -71,6 +77,9 @@ ssize_t safe_write (int fd, const void *buf, size_t count)
 ssize_t safe_read (int fd, void *buffer, size_t count)
 {
         ssize_t len;
+
+        log_message(LOG_INFO,
+                    "safe_read:  socket %d, mssg size:%d", fd, count);
 
         do {
                 len = read (fd, buffer, count);

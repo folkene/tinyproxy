@@ -455,6 +455,13 @@ static void initialize_config_defaults (struct config_s *conf)
         conf->logf_name = NULL;
         conf->pidpath = NULL;
         conf->maxclients = 100;
+
+#ifdef REMOTE_SOCKET
+        conf->port = 8888;
+        strncpy( conf->remote_socket_host, "127.0.0.1", 9 );
+        conf->remote_socket_port = 12345;
+#endif
+
 }
 
 /**
@@ -475,6 +482,8 @@ int reload_config_file (const char *config_fname, struct config_s *conf)
                 goto done;
         }
 
+#ifdef REMOTE_SOCKET
+
         /* Set the default values if they were not set in the config file. */
         if (conf->port == 0) {
                 /*
@@ -486,6 +495,7 @@ int reload_config_file (const char *config_fname, struct config_s *conf)
                 ret = -1;
                 goto done;
         }
+#endif
 
         if (!conf->user) {
                 log_message (LOG_WARNING, "You SHOULD set a UserName in the "

@@ -43,6 +43,8 @@
 #include "sock.h"
 #include "stats.h"
 #include "utils.h"
+#include "sock_proxy.h"
+#include "buffer.h"
 
 /*
  * Global Structures
@@ -50,6 +52,8 @@
 struct config_s *config;
 static struct config_s configs[2];
 static const char* config_file;
+static int port, remote_port;
+static const char * hostname;
 unsigned int received_sighup = FALSE;   /* boolean */
 
 static struct config_s*
@@ -76,6 +80,9 @@ takesig (int sig)
         case SIGINT:
         case SIGTERM:
                 config->quit = TRUE;
+#ifdef REMOTE_SOCKET
+                // close everything
+#endif
                 break;
 
         case SIGCHLD:
@@ -109,7 +116,12 @@ display_usage (void)
                 "  -d        Do not daemonize (run in foreground).\n"
                 "  -c FILE   Use an alternate configuration file.\n"
                 "  -h        Display this usage information.\n"
-                "  -v        Display version information.\n");
+                "  -v        Display version information.\n"
+#ifdef REMOTE_SOCKET
+                "  -p port  Set proxy port number (default value is 8888)\n"
+                "  -r port  Set remote socket port information\n"
+#endif
+                );
 
         /* Display the modes compiled into tinyproxy */
         printf ("\nFeatures compiled in:\n");
@@ -275,6 +287,8 @@ int
 main (int argc, char **argv)
 {
         int opt, daemonized = TRUE;
+        char * token = NULL;
+        char * tmp = NULL;
 
         srand(time(NULL)); /* for hashmap seeds */
 
@@ -291,7 +305,8 @@ main (int argc, char **argv)
 
         config_file = SYSCONFDIR "/tinyproxy.conf";
 
-        while ((opt = getopt (argc, argv, "c:vdh")) != EOF) {
+        while ((opt = getopt (argc, argv, "c:vdhp:r:")) != EOF) {
+                tmp = optarg;
                 switch (opt) {
                 case 'v':
                         display_version ();
@@ -305,6 +320,23 @@ main (int argc, char **argv)
                         config_file = optarg;
                         break;
 
+#ifdef REMOTE_SOCKET
+                case 'p':
+                        port = atoi(tmp);
+                        break;
+                case 'r':
+                        /* Format must be host:port */
+
+                        /* 1. Extract the first part : host */
+                        hostname = strtok(tmp, ":");
+                        //strncpy(config->remote_socket_host, token, MAX_HOST_LEN);
+
+                        /* 2. Extract the port and convert it to int */
+                        remote_port = atoi( strtok(NULL, ":") );
+
+                        //config->remote_socket_port = atoi(token);
+                        break;
+#endif
                 case 'h':
                         display_usage ();
                         exit (EX_OK);
@@ -314,6 +346,8 @@ main (int argc, char **argv)
                         exit (EX_USAGE);
                 }
         }
+
+        printf("port %d, hostname %s:%d\n", port, hostname, remote_port);
 
         if (reload_config(0)) {
                 exit (EX_SOFTWARE);
@@ -349,10 +383,38 @@ main (int argc, char **argv)
                 filter_init ();
 #endif /* FILTER_ENABLE */
 
+
+#ifdef REMOTE_SOCKET
+
+        config->port = port;
+        strncpy(config->remote_socket_host, hostname, MAX_HOST_LEN);
+        config->remote_socket_port = remote_port;
+
+        if( init_remote_socket() < 0 )
+        {
+                fprintf (stderr, "%s: Could not create listening sockets 1.\n",
+                                argv[0]);
+                exit (EX_OSERR);
+        }
+
+        fprintf (stdout, "%s: Before remote_start_server.\n",
+                         argv[0]);
+
+        if( start_remote_socket_server(config->remote_socket_port) == -1){
+
+                fprintf (stdout, "%s: Merde.\n",
+                         argv[0]);
+                return -1;
+        }
+        fprintf (stdout, "%s: After remote_start_server.\n",
+                         argv[0]);
+
+#endif /* #ifdef REMOTE_SOCKET */
+
         /* Start listening on the selected port. */
         if (child_listening_sockets(config->listen_addrs, config->port) < 0) {
-                fprintf (stderr, "%s: Could not create listening sockets.\n",
-                         argv[0]);
+                fprintf (stderr, "%s: Could not create listening sockets 2 %d.\n",
+                         argv[0], errno);
                 exit (EX_OSERR);
         }
 
@@ -400,6 +462,58 @@ main (int argc, char **argv)
 
         /* Start the main loop */
         log_message (LOG_INFO, "Starting main loop. Accepting connections.");
+
+        if (0){
+
+                unsigned char buff[1000];
+                unsigned char receivedBuff[1000];
+                int idx = 0;
+                int fds[2][2];
+
+                int bytes_received = 0;
+
+                struct buffer_s * pBuff = new_buffer();
+                struct buffer_s * rBuff = new_buffer();
+
+                add_to_buffer( pBuff, buff, sizeof(buff));
+
+                for(idx = 0; idx < sizeof(buff); ++idx){
+                        buff[idx] = (char)idx;
+                }
+
+                for(idx = 0; idx < sizeof(receivedBuff); ++idx){
+                        if( (idx % 8) == 0) {
+                                printf("\n");
+                        }
+
+                        printf("0x%02x ", buff[idx]);
+                }
+
+                printf("\n");
+                printf("\n");
+                printf("\n");
+
+                remote_open("www.google.fr", 80, fds);
+
+                write(fds[CLIENT_TO_SERVER][WRITE_OFFSET], buff, sizeof(buff));
+
+                while(bytes_received < sizeof(buff) ){
+                        log_message (LOG_INFO, "received %d bytes", bytes_received);
+                        bytes_received +=
+                                read (fds[SERVER_TO_CLIENT][READ_OFFSET], receivedBuff, sizeof(buff) - bytes_received);
+                }
+
+                log_message (LOG_INFO, "received        %d bytes", bytes_received);
+
+                printf("idx = %d", idx);
+
+                for(idx = 0; idx < bytes_received; ++idx){
+                        printf("0x%02x\n", receivedBuff[idx]);
+                }
+
+                printf("idx = %d\n", idx);
+        }
+
 
         child_main_loop ();
 

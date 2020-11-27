@@ -12,7 +12,7 @@ script:
 - make
 - make test
 - make clean
-- ./configure --enable-debug --enable-transparent --enable-reverse
+- ./configure --enable-debug --enable-transparent --enable-reverse --enable-remote_socket
 - make
 - make test
 - make valgrind-test

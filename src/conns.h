@@ -29,7 +29,11 @@
  */
 struct conn_s {
         int client_fd;
+#ifndef REMOTE_SOCKET
         int server_fd;
+#else
+        int server_fd[2][2];
+#endif
 
         struct buffer_s *cbuffer;
         struct buffer_s *sbuffer;
