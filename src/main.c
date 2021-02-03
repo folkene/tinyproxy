@@ -409,6 +409,8 @@ main (int argc, char **argv)
         fprintf (stdout, "%s: After remote_start_server.\n",
                          argv[0]);
 
+
+
 #endif /* #ifdef REMOTE_SOCKET */
 
         /* Start listening on the selected port. */
@@ -495,12 +497,12 @@ main (int argc, char **argv)
 
                 remote_open("www.google.fr", 80, fds);
 
-                write(fds[CLIENT_TO_SERVER][WRITE_OFFSET], buff, sizeof(buff));
+                write(fds[CLIENT_OFFSET], buff, sizeof(buff));
 
                 while(bytes_received < sizeof(buff) ){
                         log_message (LOG_INFO, "received %d bytes", bytes_received);
                         bytes_received +=
-                                read (fds[SERVER_TO_CLIENT][READ_OFFSET], receivedBuff, sizeof(buff) - bytes_received);
+                                read (fds[SERVER_OFFSET], receivedBuff, sizeof(buff) - bytes_received);
                 }
 
                 log_message (LOG_INFO, "received        %d bytes", bytes_received);

@@ -32,7 +32,7 @@ struct conn_s {
 #ifndef REMOTE_SOCKET
         int server_fd;
 #else
-        int server_fd[2][2];
+        int server_fd;
 #endif
 
         struct buffer_s *cbuffer;

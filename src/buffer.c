@@ -34,23 +34,6 @@
 #define BUFFER_HEAD(x) (x)->head
 #define BUFFER_TAIL(x) (x)->tail
 
-struct bufline_s {
-        unsigned char *string;  /* the actual string of data */
-        struct bufline_s *next; /* pointer to next in linked list */
-        size_t length;          /* length of the string of data */
-        size_t pos;             /* start sending from this offset */
-};
-
-/*
- * The buffer structure points to the beginning and end of the buffer list
- * (and includes the total size)
- */
-struct buffer_s {
-        struct bufline_s *head; /* top of the buffer */
-        struct bufline_s *tail; /* bottom of the buffer */
-        size_t size;            /* total size of the buffer */
-};
-
 /*
  * Take a string of data and a length and make a new line which can be added
  * to the buffer. The data IS copied, so make sure if you allocated your
@@ -87,7 +70,7 @@ static struct bufline_s *makenewline (unsigned char *data, size_t length)
 /*
  * Free the allocated buffer line
  */
-static void free_line (struct bufline_s *line)
+void free_line (struct bufline_s *line)
 {
         assert (line != NULL);
 
@@ -189,7 +172,7 @@ int add_to_buffer (struct buffer_s *buffptr, unsigned char *data, size_t length)
 /*
  * Remove the first line from the top of the buffer
  */
-static struct bufline_s *remove_from_buffer (struct buffer_s *buffptr)
+struct bufline_s *remove_from_buffer (struct buffer_s *buffptr)
 {
         struct bufline_s *line;
 
@@ -233,7 +216,7 @@ ssize_t read_buffer (int fd, struct buffer_s * buffptr)
         if (bytesin > 0) {
                 if (add_to_buffer (buffptr, buffer, bytesin) < 0) {
                         log_message (LOG_ERR,
-                                     "readbuff: add_to_buffer() error.");
+                                     "buffer.c | readbuff: add_to_buffer() error.");
                         bytesin = -1;
                 }
         } else if (bytesin == 0) {
@@ -255,7 +238,7 @@ ssize_t read_buffer (int fd, struct buffer_s * buffptr)
                         break;
                 default:
                         log_message (LOG_ERR,
-                                     "read_buffer: read() failed on fd %d: %s",
+                                     "buffer.c | read_buffer: read() failed on fd %d: %s",
                                      fd, strerror(errno));
                         bytesin = -1;
                         break;
@@ -264,9 +247,15 @@ ssize_t read_buffer (int fd, struct buffer_s * buffptr)
 
         safefree (buffer);
 
-        log_message(LOG_INFO, "Read from fd:%d %d bytes", fd, bytesin);
+        log_message(LOG_INFO, "buffer.c | Read from fd:%d %d bytes", fd, bytesin);
 
         return bytesin;
+}
+
+void clear_buffer(struct buffer_s * buffptr){
+        buffptr->size = 0;
+        buffptr->head = NULL;
+        buffptr->tail = NULL;
 }
 
 /*
@@ -282,7 +271,7 @@ ssize_t write_buffer (int fd, struct buffer_s * buffptr)
         assert (buffptr != NULL);
 
         log_message (LOG_INFO,
-                        "write_buffer fd:%d size:%d",
+                        "buffer.c | write_buffer fd:%d size:%d",
                         fd,
                         buffptr->size);
 
@@ -295,10 +284,16 @@ ssize_t write_buffer (int fd, struct buffer_s * buffptr)
         assert (BUFFER_HEAD (buffptr) != NULL);
         line = BUFFER_HEAD (buffptr);
 
-        log_message(LOG_INFO, "Write fd:%d %d bytes", fd, buffptr->size);
+
 
         bytessent =
             write (fd, line->string + line->pos, line->length - line->pos);
+
+
+        log_message (LOG_INFO,
+                        "buffer.c | write_buffer %d bytes written",
+                        fd,
+                        bytessent);
 
         if (bytessent >= 0) {
                 /* bytes sent, adjust buffer */
@@ -320,15 +315,109 @@ ssize_t write_buffer (int fd, struct buffer_s * buffptr)
                 case ENOBUFS:
                 case ENOMEM:
                         log_message (LOG_ERR,
-                                     "writebuff: write() error [NOBUFS/NOMEM] \"%s\" on "
+                                     "buffer.c | writebuff: write() error [NOBUFS/NOMEM] \"%s\" on "
                                      "file descriptor %d", strerror (errno),
                                      fd);
                         return 0;
                 default:
                         log_message (LOG_ERR,
-                                     "writebuff: write() error \"%s\" on file descriptor %d",
+                                     "buffer.c | writebuff: write() error \"%s\" on file descriptor %d",
                                      strerror (errno), fd);
                         return -1;
                 }
         }
+}
+
+void move_into(struct buffer_s * dest, struct buffer_s * src){
+
+
+        log_message(LOG_INFO, "buffer.c |  tid = %d, move_into dest = {head : %p, tail : %p, size : %d} / src = {head : %p, tail : %p, size : %d}",
+                pthread_self(), dest->head, dest->tail, dest->size, src->head, src->tail, src->size);
+
+        if(dest->size > 0){
+
+                dest->tail->next = src->head;
+                dest->tail = src->tail;
+        }else{
+                dest->head = src->head;
+                dest->tail = src->tail;
+        }
+
+        dest->size += src->size;
+        clear_buffer(src);
+}
+
+
+ssize_t extract_buffer(struct  buffer_s * buff, const char * data, ssize_t maxlen){
+        struct bufline_s * current = buff->head;
+        struct bufline_s * next = NULL;
+        int offset = 0;
+        ssize_t copyLen = 0;
+
+        while( (current != NULL) && (offset < maxlen)) {
+                copyLen = min( ( maxlen - offset), (current->length - current->pos) );
+
+
+
+                memcpy( &data[offset], &current->string[current->pos], copyLen );
+
+                offset += copyLen;
+                current->pos += copyLen;
+
+                next = current->next;
+
+                if(current->pos == current->length){
+                        free_line(remove_from_buffer(buff));
+                }
+
+                current = next;
+        }
+
+        return offset;
+
+};
+
+
+struct buffer_s * add_variable_buffer (struct  buffer_s * buff, const char *fmt, ...)
+{
+        ssize_t n;
+        size_t size = (1024 * 8);       /* start with 8 KB and go from there */
+        char *buf, *tmpbuf;
+        va_list ap;
+
+
+        if ((buf = (char *) safemalloc (size)) == NULL){
+                return -1;
+        }
+
+        while (1) {
+                va_start (ap, fmt);
+                n = vsnprintf (buf, size, fmt, ap);
+                va_end (ap);
+
+                /* If that worked, break out so we can send the buffer */
+                if (n > -1 && (size_t) n < size)
+                        break;
+
+                /* Else, try again with more space */
+                if (n > -1)
+                        /* precisely what is needed (glibc2.1) */
+                        size = n + 1;
+                else
+                        /* twice the old size (glibc2.0) */
+                        size *= 2;
+
+                if ((tmpbuf = (char *) saferealloc (buf, size)) == NULL) {
+                        safefree (buf);
+                        return -1;
+                } else
+                        buf = tmpbuf;
+        }
+
+        if( add_to_buffer(buff, buf, n) != 0 ){
+                buff = NULL;
+        }
+
+        safefree (buf);
+        return buff;
 }

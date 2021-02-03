@@ -22,7 +22,22 @@
 #define _TINYPROXY_BUFFER_H_
 
 /* Forward declaration */
-struct buffer_s;
+struct bufline_s {
+        unsigned char *string;  /* the actual string of data */
+        struct bufline_s *next; /* pointer to next in linked list */
+        size_t length;          /* length of the string of data */
+        size_t pos;             /* start sending from this offset */
+};
+
+/*
+ * The buffer structure points to the beginning and end of the buffer list
+ * (and includes the total size)
+ */
+struct buffer_s {
+        struct bufline_s *head; /* top of the buffer */
+        struct bufline_s *tail; /* bottom of the buffer */
+        size_t size;            /* total size of the buffer */
+};
 
 extern struct buffer_s *new_buffer (void);
 extern void delete_buffer (struct buffer_s *buffptr);
@@ -36,5 +51,13 @@ extern int add_to_buffer (struct buffer_s *buffptr, unsigned char *data,
 
 extern ssize_t read_buffer (int fd, struct buffer_s *buffptr);
 extern ssize_t write_buffer (int fd, struct buffer_s *buffptr);
+
+extern void move_into(struct buffer_s * from, struct buffer_s * into);
+ssize_t extract_buffer(struct  buffer_s * buff, const char * data, ssize_t maxlen);
+
+struct bufline_s *remove_from_buffer (struct buffer_s *buffptr);
+void free_line (struct bufline_s *line);
+
+struct buffer_s * add_variable_buffer (struct  buffer_s * buff, const char *fmt, ...);
 
 #endif /* __BUFFER_H_ */

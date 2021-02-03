@@ -266,11 +266,7 @@ establish_http_connection (struct conn_s *connptr, struct request_s *request)
         if (inet_pton(AF_INET6, request->host, dst) > 0) {
                 /* host is an IPv6 address literal, so surround it with
                  * [] */
-#ifndef REMOTE_SOCKET
-                return write_message (connptr->server_fd,
-#else
-                return write_message (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET],
-#endif
+                return write_remote_message (connptr->server_fd,
                                       "%s %s HTTP/1.0\r\n"
                                       "Host: [%s]%s\r\n"
                                       "Connection: close\r\n",
@@ -279,11 +275,8 @@ establish_http_connection (struct conn_s *connptr, struct request_s *request)
         } else if (connptr->upstream_proxy &&
                    connptr->upstream_proxy->type == PT_HTTP &&
                    connptr->upstream_proxy->ua.authstr) {
-#ifndef REMOTE_SOCKET
-                return write_message (connptr->server_fd,
-#else
-                return write_message (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET],
-#endif
+
+                return write_remote_message (connptr->server_fd,
                                       "%s %s HTTP/1.0\r\n"
                                       "Host: %s%s\r\n"
                                       "Connection: close\r\n"
@@ -292,11 +285,7 @@ establish_http_connection (struct conn_s *connptr, struct request_s *request)
                                       request->host, portbuff,
                                       connptr->upstream_proxy->ua.authstr);
         } else {
-#ifndef REMOTE_SOCKET
-                return write_message (connptr->server_fd,
-#else
-                return write_message (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET],
-#endif
+                return write_remote_message (connptr->server_fd,
                                       "%s %s HTTP/1.0\r\n"
                                       "Host: %s%s\r\n"
                                       "Connection: close\r\n",
@@ -539,13 +528,8 @@ static int pull_client_data (struct conn_s *connptr, long int length)
                         goto ERROR_EXIT;
 
                 if (!connptr->error_variables) {
-#ifndef REMOTE_SOCKET
-                if (safe_write (connptr->server_fd, buffer, len) < 0)
-                                goto ERROR_EXIT;
-#else
-                if (safe_write (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], buffer, len) < 0)
-                                goto ERROR_EXIT;
-#endif
+                        if (safe_remote_write (connptr->server_fd, buffer, len) < 0)
+                                        goto ERROR_EXIT;
                 }
 
                 length -= len;
@@ -602,15 +586,9 @@ ERROR_EXIT:
  */
 static int add_xtinyproxy_header (struct conn_s *connptr)
 {
-#ifndef REMOTE_SOCKET
         assert (connptr && connptr->server_fd >= 0);
-        return write_message (connptr->server_fd,
+        return write_remote_message (connptr->server_fd,
                               "X-Tinyproxy: %s\r\n", connptr->client_ip_addr);
-#else
-        assert (connptr && connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET] >= 0);
-        return write_message (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET],
-                              "X-Tinyproxy: %s\r\n", connptr->client_ip_addr);
-#endif
 }
 #endif /* XTINYPROXY */
 
@@ -740,6 +718,107 @@ static int get_all_headers (int fd, hashmap_t hashofheaders)
          */
         safefree (header);
         safefree (line);
+        return -1;
+}
+
+
+/*
+ * Read all the headers from the stream
+ */
+static int get_all_remote_headers (int fd, hashmap_t hashofheaders)
+{
+        char *line = NULL;
+        char *header = NULL;
+        int count;
+        char *tmp;
+        ssize_t linelen;
+        ssize_t len = 0;
+        unsigned int double_cgi = FALSE;        /* boolean */
+
+        assert (fd >= 0);
+        assert (hashofheaders != NULL);
+
+        for (count = 0; count < MAX_HEADERS; count++) {
+                if ((linelen = readremoteline (fd, &line)) <= 0) {
+                        safefree (header);
+                        safefree (line);
+                        log_message (LOG_ERR,
+                             "getAllHeader readline(%d) returned %d", fd,  linelen);
+
+                        return -1;
+                }
+
+                log_message (LOG_INFO,
+                             "getAllHeader readline (fd : %d) %d: %s check_CRLF = %d, CHECK_LWS = %d, double_cgi = %d ", fd,  linelen, line, CHECK_CRLF (line, linelen), CHECK_LWS (line, linelen) ,!double_cgi);
+
+                /*
+                 * If we received a CR LF or a non-continuation line, then add
+                 * the accumulated header field, if any, to the hashmap, and
+                 * reset it.
+                 */
+                if (CHECK_CRLF (line, linelen) || !CHECK_LWS (line, linelen)) {
+                        if (!double_cgi
+                            && len > 0
+                            && add_header_to_connection (hashofheaders, header,
+                                                         len) < 0) {
+                                safefree (header);
+                                safefree (line);
+                                return -1;
+                        }
+
+                        len = 0;
+                }
+
+                /*
+                 * If we received just a CR LF on a line, the headers are
+                 * finished.
+                 */
+                if (CHECK_CRLF (line, linelen)) {
+                        safefree (header);
+                        safefree (line);
+                        return 0;
+                }
+
+                /*
+                 * BUG FIX: The following code detects a "Double CGI"
+                 * situation so that we can handle the nonconforming system.
+                 * This problem was found when accessing cgi.ebay.com, and it
+                 * turns out to be a wider spread problem as well.
+                 *
+                 * If "Double CGI" is in effect, duplicate headers are
+                 * ignored.
+                 *
+                 * FIXME: Might need to change this to a more robust check.
+                 */
+                if (linelen >= 5 && strncasecmp (line, "HTTP/", 5) == 0) {
+                        double_cgi = TRUE;
+                }
+
+                /*
+                 * Append the new line to the current header field.
+                 */
+                tmp = (char *) saferealloc (header, len + linelen);
+                if (tmp == NULL) {
+                        safefree (header);
+                        safefree (line);
+                        return -1;
+                }
+
+                header = tmp;
+                memcpy (header + len, line, linelen);
+                len += linelen;
+
+                safefree (line);
+        }
+
+        /*
+         * If we get here, this means we reached MAX_HEADERS count.
+         * Bail out with error.
+         */
+        safefree (header);
+        safefree (line);
+        log_message (LOG_ERR,
+                             "getAllHeader reaches max header count");
         return -1;
 }
 
@@ -900,21 +979,12 @@ process_client_headers (struct conn_s *connptr, hashmap_t hashofheaders)
          * a stats request, or if this was a CONNECT method (unless upstream
          * http proxy is in use.)
          */
-#ifndef REMOTE_SOCKET
         if (connptr->server_fd == -1 || connptr->show_stats
             || (connptr->connect_method && ! UPSTREAM_IS_HTTP(connptr))) {
                 log_message (LOG_INFO,
                              "Not sending client headers to remote machine");
                 return 0;
         }
-#else
-        if (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET] == -1 || connptr->show_stats
-            || (connptr->connect_method && ! UPSTREAM_IS_HTTP(connptr))) {
-                log_message (LOG_INFO,
-                             "Not sending client headers to remote machine");
-                return 0;
-        }
-#endif
 
         /*
          * See if there is a "Content-Length" header.  If so, again we need
@@ -936,11 +1006,7 @@ process_client_headers (struct conn_s *connptr, hashmap_t hashofheaders)
         }
 
         /* Send, or add the Via header */
-#ifndef REMOTE_SOCKET
         ret = write_via_header (connptr->server_fd,
-#else
-        ret = write_via_header (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET],
-#endif
                                 hashofheaders,
                                 connptr->protocol.major,
                                 connptr->protocol.minor);
@@ -965,14 +1031,12 @@ process_client_headers (struct conn_s *connptr, hashmap_t hashofheaders)
 
                         if (!is_anonymous_enabled (config)
                             || anonymous_search (config, data) > 0) {
+
+                                log_message(LOG_INFO, "process_client_header --> %s: %s\r\n", data, header);
                                 ret =
-#ifndef REMOTE_SOCKET
-                                write_message (connptr->server_fd,
+                                write_remote_message (connptr->server_fd,
                                                    "%s: %s\r\n", data, header);
-#else
-                                write_message (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET],
-                                                   "%s: %s\r\n", data, header);
-#endif
+
                                 if (ret < 0) {
                                         log_message(LOG_ERR, "error %s : ", strerror(errno));
                                         indicate_http_error (connptr, 503,
@@ -992,16 +1056,9 @@ process_client_headers (struct conn_s *connptr, hashmap_t hashofheaders)
                 add_xtinyproxy_header (connptr);
 #endif
 
-#ifndef REMOTE_SOCKET
         /* Write the final "blank" line to signify the end of the headers */
-        if (safe_write (connptr->server_fd, "\r\n", 2) < 0)
+        if (safe_remote_write (connptr->server_fd, "\r\n", 2) < 0)
                 return -1;
-
-#else
-        /* Write the final "blank" line to signify the end of the headers */
-        if (safe_write (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], "\r\n", 2) < 0)
-                return -1;
-#endif
 
         /*
          * Spin here pulling the data from the client.
@@ -1043,11 +1100,10 @@ static int process_server_headers (struct conn_s *connptr)
 
         /* Get the response line from the remote server. */
 retry:
-#ifndef REMOTE_SOCKET
-        len = readline (connptr->server_fd, &response_line);
-#else
-        len = readline (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], &response_line);
-#endif
+        len = readremoteline (connptr->server_fd, &response_line);
+
+        log_message(LOG_INFO, "readremoteline returned : %d --> %s", len, response_line);
+
         if (len <= 0)
                 return -1;
 
@@ -1055,6 +1111,8 @@ retry:
          * Strip the new line and character return from the string.
          */
         if (chomp (response_line, len) == len) {
+
+                log_message(LOG_INFO, "go to retry", len, response_line);
                 /*
                  * If the number of characters removed is the same as the
                  * length then it was a blank line. Free the buffer and
@@ -1073,11 +1131,7 @@ retry:
         /*
          * Get all the headers from the remote server in a big hash
          */
-#ifndef REMOTE_SOCKET
-        if (get_all_headers (connptr->server_fd, hashofheaders) < 0)
-#else
-        if (get_all_headers (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], hashofheaders) < 0)
-#endif
+        if (get_all_remote_headers (connptr->server_fd, hashofheaders) < 0)
         {
                 log_message (LOG_WARNING,
                              "Could not retrieve all the headers from the remote server.");
@@ -1209,7 +1263,8 @@ ERROR_EXIT:
 }
 
 
-#if 0
+int g_cpt_req = 0;
+
 /*
  * Switch the sockets into nonblocking mode and begin relaying the bytes
  * between the two connections. We continue to use the buffering code
@@ -1225,28 +1280,22 @@ static void relay_connection (struct conn_s *connptr)
         time_t last_access;
         int ret;
         double tdiff;
-#ifndef REMOTE_SOCKET
         int maxfd = max (connptr->client_fd, connptr->server_fd) + 1;
-#else
-        int maxfd = max (connptr->client_fd, connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET]) + 1;
-#endif
 
         ssize_t bytes_received;
 
+        remote_set_transparent(connptr->server_fd);
+
         ret = socket_nonblocking (connptr->client_fd);
         if (ret != 0) {
-                log_message(LOG_ERR, "Failed to set the client socket "
+                log_message(LOG_ERR, "reqs.c | Failed to set the client socket "
                             "to non-blocking: %s", strerror(errno));
                 goto end;
         }
 
-#ifndef REMOTE_SOCKET
         ret = socket_nonblocking (connptr->server_fd);
-#else
-        ret = socket_nonblocking (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET]);
-#endif
         if (ret != 0) {
-                log_message(LOG_ERR, "Failed to set the server socket "
+                log_message(LOG_ERR, "reqs.c | Failed to set the server socket "
                             "to non-blocking: %s", strerror(errno));
                 goto end;
         }
@@ -1254,7 +1303,11 @@ static void relay_connection (struct conn_s *connptr)
         last_access = time (NULL);
 
         for (;;) {
-                log_message(LOG_INFO, "Loop relay_connection / sBuffer size = %d, cbuffer size = %d", buffer_size (connptr->sbuffer), buffer_size (connptr->cbuffer));
+                log_message(LOG_INFO, "reqs.c | Loop relay_connection / sBuffer size = %d, cbuffer size = %d / client fd = %d, server fd=%d",
+                                                buffer_size (connptr->sbuffer),
+                                                buffer_size (connptr->cbuffer),
+                                                connptr->client_fd,
+                                                connptr->server_fd);
                 FD_ZERO (&rset);
                 FD_ZERO (&wset);
 
@@ -1265,18 +1318,9 @@ static void relay_connection (struct conn_s *connptr)
                 if (buffer_size (connptr->sbuffer) > 0)
                         FD_SET (connptr->client_fd, &wset);
                 if (buffer_size (connptr->cbuffer) > 0)
-#ifndef REMOTE_SOCKET
                         FD_SET (connptr->server_fd, &wset);
-#else
-                        FD_SET (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], &wset);
-                        log_message(LOG_INFO, "FD_ISSET = %d", FD_ISSET (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], &wset));
-#endif
                 if (buffer_size (connptr->sbuffer) < MAXBUFFSIZE)
-#ifndef REMOTE_SOCKET
                         FD_SET (connptr->server_fd, &rset);
-#else
-                        FD_SET (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], &rset);
-#endif
                 if (buffer_size (connptr->cbuffer) < MAXBUFFSIZE)
                         FD_SET (connptr->client_fd, &rset);
 
@@ -1286,7 +1330,7 @@ static void relay_connection (struct conn_s *connptr)
                         tdiff = difftime (time (NULL), last_access);
                         if (tdiff > config->idletimeout) {
                                 log_message (LOG_INFO,
-                                             "Idle Timeout (after select) as %g > %u.",
+                                             "reqs.c | Idle Timeout (after select) as %g > %u.",
                                              tdiff, config->idletimeout);
                                 return;
                         } else {
@@ -1294,9 +1338,9 @@ static void relay_connection (struct conn_s *connptr)
                         }
                 } else if (ret < 0) {
                         log_message (LOG_ERR,
-                                     "relay_connection: select() error \"%s\". "
-                                     "Closing connection (client_fd:%d, server_fd)",
-                                     strerror (errno), connptr->client_fd);
+                                     "reqs.c | relay_connection: select() error(%d) \"%s\". "
+                                     "Closing connection (client_fd:%d, server_fd = %d)",
+                                     errno, strerror (errno), connptr->client_fd, connptr->server_fd);
                         goto end;
                 } else {
                         /*
@@ -1305,42 +1349,43 @@ static void relay_connection (struct conn_s *connptr)
                         last_access = time (NULL);
                 }
 
-#ifndef REMOTE_SOCKET
                 if (FD_ISSET (connptr->server_fd, &rset)) {
+                        struct buffer_s tmp;
                         bytes_received =
-                            read_buffer (connptr->server_fd, connptr->sbuffer);
-#else
-                if (FD_ISSET (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], &rset)) {
-                        bytes_received =
-                            read_buffer (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], connptr->sbuffer);
+                            read (connptr->server_fd,&tmp, sizeof(tmp));
 
-                        log_message(LOG_INFO, "relay connection : Received %d bytes from remote server fd %d", bytes_received, connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET]);
-#endif
+                        log_message (LOG_INFO, "reqs.c | relay_connexion (%d): read from server_fd size : %d from fd : \n ", pthread_self(),  bytes_received, connptr->server_fd);
 
                         if (bytes_received < 0)
                                 break;
+
+                        log_message (LOG_INFO, "reqs.c | relay_connexion (%d): read from server_fd nb %d buffer size : %d from fd %d\n ", pthread_self(), g_cpt_req++,  tmp.size, connptr->server_fd);
+
+                        bytes_received = tmp.size;
+                        move_into(connptr->sbuffer, &tmp);
 
                         connptr->content_length.server -= bytes_received;
                         if (connptr->content_length.server == 0)
                                 break;
                 }
+
                 if (FD_ISSET (connptr->client_fd, &rset)
                     && read_buffer (connptr->client_fd, connptr->cbuffer) < 0) {
                         break;
                 }
-#ifndef REMOTE_SOCKET
-                if (FD_ISSET (connptr->server_fd, &wset)
-                    && write_buffer (connptr->server_fd, connptr->cbuffer) < 0) {
-                        break;
-                }
-#else
-                log_message(LOG_INFO, "FD_ISSET = %d", FD_ISSET (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], &wset));
 
-                if (FD_ISSET (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], &wset)
-                    && write_buffer (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], connptr->cbuffer) < 0) {
-                        break;
+                if (FD_ISSET (connptr->server_fd, &wset)){
+
+                        log_message (LOG_INFO, "reqs.c | write cbuffer size : %d\n ", connptr->cbuffer->size);
+                        log_message (LOG_INFO, "reqs.c | tail = %p\n", connptr->cbuffer->tail);
+
+                        if( write(connptr->server_fd, connptr->cbuffer, sizeof(struct buffer_s )) < 0 ){
+                                break;
+                        }
+
+                        clear_buffer(connptr->cbuffer);
                 }
-#endif
+
                 if (FD_ISSET (connptr->client_fd, &wset)
                     && write_buffer (connptr->client_fd, connptr->sbuffer) < 0) {
                         break;
@@ -1354,7 +1399,7 @@ static void relay_connection (struct conn_s *connptr)
         ret = socket_blocking (connptr->client_fd);
         if (ret != 0) {
                 log_message(LOG_ERR,
-                            "Failed to set client socket to blocking: %s",
+                            "reqs.c | Failed to set client socket to blocking: %s",
                             strerror(errno));
                 goto end;
         }
@@ -1365,48 +1410,34 @@ static void relay_connection (struct conn_s *connptr)
         }
         shutdown (connptr->client_fd, SHUT_WR);
 
-#ifndef REMOTE_SOCKET
         /*
          * Try to send any remaining data to the server if we can.
          */
         ret = socket_blocking (connptr->server_fd);
         if (ret != 0) {
                 log_message(LOG_ERR,
-                            "Failed to set server socket to blocking: %s",
+                            "reqs.c | Failed to set server socket to blocking: %s",
                             strerror(errno));
                 goto end;
         }
 
-        while (buffer_size (connptr->cbuffer) > 0) {
-                if (write_buffer (connptr->server_fd, connptr->cbuffer) < 0)
-                        break;
-        }
-#else
-        /*
-         * Try to send any remaining data to the server if we can.
-         */
-        ret = socket_blocking (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET]);
-        if (ret != 0) {
-                log_message(LOG_ERR,
-                            "Failed to set server socket to blocking: %s",
-                            strerror(errno));
-                goto end;
-        }
 
         while (buffer_size (connptr->cbuffer) > 0) {
-                if (write_buffer (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], connptr->cbuffer) < 0)
-                        break;
-        }
 
-#endif
+
+                if( write(connptr->server_fd, connptr->cbuffer, sizeof(connptr->cbuffer)) < 0 ){
+                        break;
+                }
+
+                clear_buffer(connptr->cbuffer);
+        }
 
 end:
-        log_message(LOG_INFO, "end of relay_connection");
+        log_message(LOG_INFO, "reqs.c | end of relay_connection");
 
         return;
 }
 
-#endif
 
 
 
@@ -1414,7 +1445,7 @@ end:
 
 
 
-
+#if 0
 
 static void relay_connection (struct conn_s *connptr)
 {
@@ -1423,7 +1454,7 @@ static void relay_connection (struct conn_s *connptr)
         time_t last_access;
         int ret;
         double tdiff;
-        int maxfd = max (connptr->client_fd, connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET]) + 1;
+        int maxfd = max (connptr->client_fd, connptr->server_fd) + 1;
 
         ssize_t bytes_received;
 
@@ -1434,12 +1465,12 @@ static void relay_connection (struct conn_s *connptr)
                 goto end;
         }
 
-        // ret = socket_nonblocking (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET]);
-        // if (ret != 0) {
-        //         log_message(LOG_ERR, "Failed to set the server socket "
-        //                     "to non-blocking: %s", strerror(errno));
-        //         goto end;
-        // }
+        ret = socket_nonblocking (connptr->server_fd[SERVER_OFFSET]);
+        if (ret != 0) {
+                log_message(LOG_ERR, "Failed to set the server socket "
+                            "to non-blocking: %s", strerror(errno));
+                goto end;
+        }
 
         last_access = time (NULL);
 
@@ -1452,7 +1483,7 @@ static void relay_connection (struct conn_s *connptr)
                 tv.tv_usec = 0;
 
                 if (buffer_size (connptr->sbuffer) < MAXBUFFSIZE)
-                        FD_SET (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], &rset);
+                        FD_SET (connptr->server_fd[SERVER_OFFSET], &rset);
 
                 if (buffer_size (connptr->cbuffer) < MAXBUFFSIZE)
                         FD_SET (connptr->client_fd, &rset);
@@ -1473,7 +1504,7 @@ static void relay_connection (struct conn_s *connptr)
                         log_message (LOG_ERR,
                                      "relay_connection: select() error \"%s\". "
                                      "Closing connection (client_fd:%d, server_fd=%d)",
-                                     strerror (errno), connptr->client_fd, connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET]);
+                                     strerror (errno), connptr->client_fd, connptr->server_fd[SERVER_OFFSET]);
                         goto end;
                 } else {
                         /*
@@ -1482,11 +1513,11 @@ static void relay_connection (struct conn_s *connptr)
                         last_access = time (NULL);
                 }
 
-                if (FD_ISSET (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], &rset)) {
+                if (FD_ISSET (connptr->server_fd[SERVER_OFFSET], &rset)) {
                         bytes_received =
-                            read_buffer (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], connptr->sbuffer);
+                            read_buffer (connptr->server_fd[SERVER_OFFSET], connptr->sbuffer);
 
-                        log_message(LOG_INFO, "relay connection : Received %d bytes from remote server fd %d", bytes_received, connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET]);
+                        log_message(LOG_INFO, "relay connection : Received %d bytes from remote server fd %d", bytes_received, connptr->server_fd[SERVER_OFFSET]);
 
                         if (bytes_received < 0)
                                 break;
@@ -1505,7 +1536,7 @@ static void relay_connection (struct conn_s *connptr)
                     if (bytes_received < 0)
                         break;
 
-                    write_buffer (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], connptr->cbuffer);
+                    write_buffer (connptr->server_fd[CLIENT_OFFSET], connptr->cbuffer);
                 }
         }
 
@@ -1530,7 +1561,7 @@ static void relay_connection (struct conn_s *connptr)
         /*
          * Try to send any remaining data to the server if we can.
          */
-        ret = socket_blocking (connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET]);
+        ret = socket_blocking (connptr->server_fd[SERVER_OFFSET]);
         if (ret != 0) {
                 log_message(LOG_ERR,
                             "Failed to set server socket to blocking: %s",
@@ -1539,7 +1570,7 @@ static void relay_connection (struct conn_s *connptr)
         }
 
         while (buffer_size (connptr->cbuffer) > 0) {
-                if (write_buffer (connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], connptr->cbuffer) < 0)
+                if (write_buffer (connptr->server_fd[CLIENT_OFFSET], connptr->cbuffer) < 0)
                         break;
         }
 
@@ -1552,6 +1583,8 @@ end:
 
 
 }
+
+#endif
 
 
 
@@ -1588,7 +1621,7 @@ connect_to_upstream_proxy(struct conn_s *connptr, struct request_s *request)
 
 	log_message(LOG_CONN,
 		    "Established connection to %s proxy \"%s\" using file descriptor %d.",
-		    proxy_type_name(cur_upstream->type), cur_upstream->host, connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET]);
+		    proxy_type_name(cur_upstream->type), cur_upstream->host, connptr->server_fd);
 
 	if (cur_upstream->type == PT_SOCKS4) {
 
@@ -1599,9 +1632,9 @@ connect_to_upstream_proxy(struct conn_s *connptr, struct request_s *request)
 		host = gethostbyname(request->host);
 		memcpy(&buff[4], host->h_addr_list[0], 4); /* dest ip */
 		buff[8] = 0; /* user */
-		if (9 != safe_write(connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], buff, 9))
+		if (9 != safe_remote_write(connptr->server_fd, buff, 9))
 			return -1;
-		if (8 != safe_read(connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], buff, 8))
+		if (8 != safe_read(connptr->server_fd, buff, 8))
 			return -1;
 		if (buff[0]!=0 || buff[1]!=90)
 			return -1;
@@ -1614,9 +1647,9 @@ connect_to_upstream_proxy(struct conn_s *connptr, struct request_s *request)
 		buff[1] = n_methods; /* number of methods  */
 		buff[2] = 0; /* no auth method */
 		if (ulen) buff[3] = 2;  /* auth method -> username / password */
-		if (2+n_methods != safe_write(connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], buff, 2+n_methods))
+		if (2+n_methods != safe_write(connptr->server_fd, buff, 2+n_methods))
 			return -1;
-		if (2 != safe_read(connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], buff, 2))
+		if (2 != safe_read(connptr->server_fd, buff, 2))
 			return -1;
 		if (buff[0] != 5 || (buff[1] != 0 && buff[1] != 2))
 			return -1;
@@ -1637,10 +1670,10 @@ connect_to_upstream_proxy(struct conn_s *connptr, struct request_s *request)
 			memcpy(cur, cur_upstream->pass, c);
 			cur += c;
 
-			if((cur - out) != safe_write(connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], out, cur - out))
+			if((cur - out) != safe_write(connptr->server_fd, out, cur - out))
 				return -1;
 
-			if(2 != safe_read(connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], in, 2))
+			if(2 != safe_read(connptr->server_fd, in, 2))
 				return -1;
 			if(in[1] != 0 || !(in[0] == 5 || in[0] == 1)) {
 				return -1;
@@ -1658,9 +1691,9 @@ connect_to_upstream_proxy(struct conn_s *connptr, struct request_s *request)
 		memcpy(&buff[5], request->host, len); /* dest ip */
 		port = htons(request->port);
 		memcpy(&buff[5+len], &port, 2); /* dest port */
-		if (7+len != safe_write(connptr->server_fd[CLIENT_TO_SERVER][WRITE_OFFSET], buff, 7+len))
+		if (7+len != safe_write(connptr->server_fd, buff, 7+len))
 			return -1;
-		if (4 != safe_read(connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], buff, 4))
+		if (4 != safe_read(connptr->server_fd, buff, 4))
 			return -1;
 		if (buff[0]!=5 || buff[1]!=0)
 			return -1;
@@ -1668,13 +1701,13 @@ connect_to_upstream_proxy(struct conn_s *connptr, struct request_s *request)
 			case 1: len=4; break; /* ip v4 */
 			case 4: len=16; break; /* ip v6 */
 			case 3: /* domainname */
-				if (1 != safe_read(connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], buff, 1))
+				if (1 != safe_read(connptr->server_fd, buff, 1))
 					return -1;
 				len = buff[0]; /* max = 255 */
 				break;
 			default: return -1;
 		}
-		if (2+len != safe_read(connptr->server_fd[SERVER_TO_CLIENT][READ_OFFSET], buff, 2+len))
+		if (2+len != safe_read(connptr->server_fd, buff, 2+len))
 			return -1;
 	} else {
 		return -1;
@@ -2011,7 +2044,7 @@ e401:
                              "file descriptor %d.", request->host,
                              connptr->server_fd);
 #else
-                if( remote_open(request->host, request->port,connptr->server_fd) < 0 ){
+                if( remote_open(request->host, request->port,&connptr->server_fd) < 0 ){
                         indicate_http_error (connptr, 500, "Unable to connect",
                                              "detail",
                                              PACKAGE_NAME " "
@@ -2019,10 +2052,12 @@ e401:
                                              "error", strerror (errno), NULL);
                         goto fail;
                 }
+
+                remote_set_nontransparent(connptr->server_fd);
                 log_message (LOG_CONN,
                              "Established connection to host \"%s\" using "
                              "file descriptor %d.", request->host,
-                             connptr->server_fd[0]);
+                             connptr->server_fd);
 #endif
 
 
@@ -2054,8 +2089,8 @@ e401:
 
         log_message (LOG_INFO,
                      "Closed connection between local client (fd:%d) "
-                     "and remote client (fd:0)",
-                     connptr->client_fd);
+                     "and remote client (fd:%d)",
+                     connptr->client_fd, connptr->server_fd);
 
         goto done;
 
