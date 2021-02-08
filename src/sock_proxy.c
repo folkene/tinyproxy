@@ -6,6 +6,7 @@
 #if 1
 
 #include <pthread.h>
+#include <stdint.h>
 
 #include "sock_proxy.h"
 #include "sock.h"
@@ -34,7 +35,7 @@
     ( (int) ((buff)[0] << 8)  + \
     ( (int) (buff) [1] ) )
 
-#define MAX_CLIENT 10
+#define MAX_CLIENT 50
 
 #define MAXIMUM_BUFFER_LENGTH (128 * 1024)
 
@@ -60,6 +61,26 @@ static void waitForCondition(tCond * cond){
 static void triggerCondition(tCond * cond){
     pthread_cond_signal(&cond->cnd);
     pthread_mutex_unlock(&cond->mtx);
+}
+
+#define CRC_LEN sizeof(uint32_t)
+
+static unsigned int crc32b(uint8_t * message, uint32_t len) {
+   int i, j;
+   unsigned int byte, crc, mask;
+
+   i = 0;
+   crc = 0xFFFFFFFF;
+   while (i < len) {
+      byte = message[i];            // Get next byte.
+      crc = crc ^ byte;
+      for (j = 7; j >= 0; j--) {    // Do eight times.
+         mask = -(crc & 1);
+         crc = (crc >> 1) ^ (0xEDB88320 & mask);
+      }
+      i = i + 1;
+   }
+   return ~crc;
 }
 
 #define SELECT_TIMEOUT_USEC 5000
@@ -211,24 +232,40 @@ static void process_incoming_data_server(void){
             size = DECODE_UINT32(&g_RemoteSocket.rx[offset]);
             offset += 4;
 
-            log_message(LOG_INFO, "sock_proxy.c | process_incoming_data_server : decoded size == %d", size);
+            log_message(LOG_INFO, "sock_proxy.c | process_incoming_data_server : decoded size == %x", size);
 
-            while (recv_data < (offset + size) )
+            while (recv_data < (offset + size + CRC_LEN) )
             {
                 int tmp = read(g_RemoteSocket.remote_sd,
                             &g_RemoteSocket.rx[recv_data],
-                            ((size + offset) - recv_data));
+                            ((size + offset + CRC_LEN) - recv_data));
 
                 log_message(LOG_INFO, "sock_proxy.c | process_incoming_data_server : read == %d bytes / ", tmp, size);
 
                 if(tmp == -1){
                     //TODO
                     log_message(LOG_INFO, "sock_proxy.c | process_incoming_data_server : ERRNO == %s", strerror(errno));
-                    recv_data = size + 4;
+                    recv_data = size + CRC_LEN;
                 }else{
                     recv_data += tmp;
                 }
             }
+
+
+            // checksum verification
+
+            uint32_t crc = 0;
+
+            uint32_t crc_received = DECODE_UINT32( &(g_RemoteSocket.rx[offset + size]));
+            crc = crc32b(&g_RemoteSocket.rx[offset], size);
+
+            log_message(LOG_INFO, "sock_proxy.c | CRC VERIFICATION : %08x / %08x", crc, crc_received);
+
+            if(crc != crc_received){
+                log_message(LOG_ERR, "sock_proxy.c | CRC VERIFICATION FAILED : %08x / %08x", crc, crc_received);
+            }
+
+
 
 
             char action = g_RemoteSocket.rx[offset ++];
@@ -337,6 +374,8 @@ static void process_incoming_data_server(void){
                     log_message(LOG_ERR, "sock_proxy.c | Invalid received action %d", action);
                     break;
             }
+
+            offset += 4;
         }
     }
 }
@@ -518,6 +557,7 @@ int init_remote_socket(void){
 
 void end_remote_socket(void){
     g_RemoteSocket.exit = 1;
+    log_message(LOG_ERR, "end_remote_socket");
     close(g_RemoteSocket.remote_sd);
 }
 
@@ -606,6 +646,8 @@ int remote_open(const char * hostname, int port, int * fd){
     ope.action_details.open.hostname_len = strlen(hostname);
     ope.action_details.open.port = port;
 
+    log_message(LOG_INFO, "sock_proxy.c | remote_open nb_socket = %d / MAX = %d", g_RemoteSocket.nb_sockets, MAX_CLIENT);
+
     if( g_RemoteSocket.nb_sockets == MAX_CLIENT ){
         return -1;
     }
@@ -661,6 +703,7 @@ static int send_remote_operation( tRemoteOperation * operation){
 
     uint32_t i = 0;
     uint32_t offset = 4;
+    uint32_t crc = 0;
 
     buff[offset++] = operation->action;
     switch (operation->action)
@@ -677,7 +720,11 @@ static int send_remote_operation( tRemoteOperation * operation){
 
             ENCODE_UINT32(offset - 4, buff, 0 )
 
-            return write(g_RemoteSocket.remote_sd, buff, offset);
+            crc = crc32b(&buff[4], offset - 4);
+
+            ENCODE_UINT32(crc, buff, offset);
+
+            return write(g_RemoteSocket.remote_sd, buff, offset + 4);
             break;
 
         case CLOSE:
@@ -685,6 +732,11 @@ static int send_remote_operation( tRemoteOperation * operation){
             offset += 4;
 
             ENCODE_UINT32(offset - 4, buff, 0 )
+
+            crc = crc32b(&buff[4], offset - 4);
+
+            ENCODE_UINT32(crc, buff, offset);
+
             return write(g_RemoteSocket.remote_sd, buff, offset);
             break;
 
@@ -701,14 +753,20 @@ static int send_remote_operation( tRemoteOperation * operation){
 
                 do{
                     int nbCpy = operation->action_details.data.data_len - offset_data;
-                    if((nbCpy + offset) > sizeof(buff) )
-                        nbCpy = sizeof(buff) - offset;
+                    if((nbCpy + offset + CRC_LEN) > sizeof(buff) )
+                        nbCpy = sizeof(buff) - offset - CRC_LEN;
 
                     memcpy( &buff[offset],
                             &operation->action_details.data.data[offset_data],
                             nbCpy);
 
                     offset += nbCpy;
+
+                    crc = crc32b(&buff[4], offset - 4);
+
+                    ENCODE_UINT32(crc, buff, offset);
+
+                    offset += CRC_LEN;
 
                     ret = write(g_RemoteSocket.remote_sd, buff, offset);
 
