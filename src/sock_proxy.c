@@ -8,6 +8,10 @@
 #include <pthread.h>
 #include <stdint.h>
 
+#include <sys/time.h>
+#include <sys/types.h>
+#include <sys/ioctl.h>
+
 #include "sock_proxy.h"
 #include "sock.h"
 #include "log.h"
@@ -479,8 +483,8 @@ static void * remote_socket_recv_thread(void * args){
                 FD_SET (clientFd, &set);
                 log_message(LOG_INFO, "sock_proxy.c | remote_socket_recv_thread FD_SET(%d, &set)", clientFd);
                 maxFds = max(maxFds, clientFd);
-                --idx;
             }
+            --idx;
         }
 
         log_message(LOG_INFO, "sock_proxy.c | exit loop %d", g_RemoteSocket.nb_sockets);
@@ -495,6 +499,25 @@ static void * remote_socket_recv_thread(void * args){
 
         if(ret == -1){
             log_message(LOG_ERR, "sock_proxy.c | select returned -1 errno : %s", strerror(errno));
+
+            idx = g_RemoteSocket.nb_sockets - 1;
+
+            while( ( g_RemoteSocket.nb_sockets > 0 ) && (idx >= 0 ) )
+            {
+                int clientFd = g_RemoteSocket.sockets[idx].fds[SERVER_OFFSET];
+
+                if( FD_ISSET(clientFd, &set) ){
+                    int n = 0;
+                    ioctl(clientFd, FIONREAD, &n);
+
+                    if(n == 0){
+                        log_message(LOG_ERR, "sock_proxy.c | idx = %d closed", clientFd);
+                        close_connection(g_RemoteSocket.sockets[idx].remote_socket);
+                    }
+                }
+
+                idx -- ;
+            }
 
         }else if(ret == 0){
 
@@ -736,6 +759,8 @@ static int send_remote_operation( tRemoteOperation * operation){
             crc = crc32b(&buff[4], offset - 4);
 
             ENCODE_UINT32(crc, buff, offset);
+
+            offset += CRC_LEN;
 
             return write(g_RemoteSocket.remote_sd, buff, offset);
             break;
